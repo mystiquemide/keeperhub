@@ -188,16 +188,22 @@ Returns detailed step-by-step logs for a specific execution.
 GET /api/analytics/spend-cap
 ```
 
-Returns current spending status against configured daily spending caps.
+Returns current spending status against the daily spending caps.
+
+`dailyCapWei` and `dailySolanaCapLamports` report what the organization configured, and are `null` when it configured nothing. That is not the same as being uncapped: the `effective*` fields carry the figure enforcement actually applies, which is the platform default whenever `usingDefault*` is true. Plan against the effective figures.
 
 ### Response
 
 ```json
 {
-  "dailyCapWei": "100000000000000000",
-  "spentTodayWei": "25000000000000000",
-  "remainingWei": "75000000000000000",
-  "percentUsed": 25.0
+  "dailyCapWei": null,
+  "dailyUsedWei": "25000000000000000",
+  "dailySolanaCapLamports": null,
+  "dailySolanaUsedLamports": "0",
+  "effectiveDailyCapWei": "50000000000000000",
+  "effectiveDailySolanaCapLamports": "1000000000",
+  "usingDefaultDailyCap": true,
+  "usingDefaultDailySolanaCap": true
 }
 ```
 

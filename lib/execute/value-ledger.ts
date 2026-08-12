@@ -8,6 +8,11 @@ import {
   orgValueReservations,
 } from "@/lib/db/schema-extensions";
 import { parseNodeNativeValueWei } from "@/lib/execute/reserved-value";
+import {
+  getDefaultDailySolanaValueCapLamports,
+  getDefaultDailyValueCapWei,
+} from "@/lib/execute/spend-cap-defaults";
+import { logSecurityEvent } from "@/lib/logging";
 
 // In-flight rows older than this are treated as stale (crashed pod / lost
 // process) and drop out of the cap SUM, matching the direct-execution
@@ -130,6 +135,74 @@ export function getOrgValueUsedTodayWei(
   return sumOrgValueTodayWei(db, organizationId);
 }
 
+export type LockedSpendCap = {
+  dailyValueCapWei: string | null;
+  dailySolanaValueCapLamports: string | null;
+  // True when this transaction had to create the row because the org had never
+  // had one. Only ever true once per org; afterwards an unset cap reports
+  // `cap_unset_for_chain_family` instead.
+  created: boolean;
+};
+
+/**
+ * Take the org's spend-cap row for the rest of the transaction, creating it if
+ * it does not exist, and return the configured caps.
+ *
+ * `SELECT ... FOR UPDATE` locks nothing when the row is absent, and an org with
+ * no row is exactly the population the platform default was written for. Without
+ * a row to lock, concurrent callers would all read a zero day-total and each
+ * reserve the full default, overshooting it by however many requests are in
+ * flight -- the TOCTOU the cap exists to close, reopened for every organization
+ * that has never configured one. Creating the row on first use gives every
+ * later caller something to serialize on.
+ *
+ * The row is written with both cap columns NULL. That still means "no cap
+ * configured" and still resolves to the platform default at read time, so this
+ * is a lock anchor and not a frozen copy of today's default: changing the
+ * default still moves the ceiling for these organizations.
+ */
+export async function lockOrgSpendCapRow(
+  executor: Executor,
+  organizationId: string
+): Promise<LockedSpendCap> {
+  const selectForUpdate = () =>
+    executor
+      .select({
+        dailyValueCapWei: organizationSpendCaps.dailyValueCapWei,
+        dailySolanaValueCapLamports:
+          organizationSpendCaps.dailySolanaValueCapLamports,
+      })
+      .from(organizationSpendCaps)
+      .where(eq(organizationSpendCaps.organizationId, organizationId))
+      .for("update")
+      .limit(1);
+
+  const existing = await selectForUpdate();
+  if (existing[0]) {
+    return {
+      dailyValueCapWei: existing[0].dailyValueCapWei ?? null,
+      dailySolanaValueCapLamports:
+        existing[0].dailySolanaValueCapLamports ?? null,
+      created: false,
+    };
+  }
+
+  // A concurrent inserter blocks here on the unique index until it commits, so
+  // the re-read below either finds its row and locks it, or finds ours.
+  await executor
+    .insert(organizationSpendCaps)
+    .values({ organizationId })
+    .onConflictDoNothing({ target: organizationSpendCaps.organizationId });
+
+  const created = await selectForUpdate();
+  return {
+    dailyValueCapWei: created[0]?.dailyValueCapWei ?? null,
+    dailySolanaValueCapLamports:
+      created[0]?.dailySolanaValueCapLamports ?? null,
+    created: true,
+  };
+}
+
 export type ReserveResult =
   | { allowed: true; reservationId: string }
   | { allowed: false; reason: string };
@@ -149,37 +222,43 @@ type ReserveParams = {
  * the direct-execution API (workflow steps, protocol writes) so the cap cannot
  * be bypassed by using a different entrance.
  *
- * A `SELECT ... FOR UPDATE` on the cap row serializes per org (the same row the
- * direct routes lock, so direct + workflow reservations serialize together); the
- * day's value across BOTH stores is summed; the request is denied if it would
- * push the total over the cap; otherwise a `reserved` ledger row is inserted so
- * concurrent callers see it (closing the TOCTOU). When the org has no cap,
- * nothing is recorded (unlimited) and the empty reservationId makes settle/
- * release a no-op.
+ * `lockOrgSpendCapRow` takes the cap row for the transaction, creating it first
+ * if the org has none, so the lock exists even for an org that never configured
+ * a cap; it is the same row the direct routes lock, so direct + workflow
+ * reservations serialize together. The day's value across BOTH stores is then
+ * summed, the request is denied if it would push the total over the cap, and
+ * otherwise a `reserved` ledger row is inserted so concurrent callers see it
+ * (closing the TOCTOU). An org that has not set a cap gets the platform default
+ * rather than unlimited spending, so a workflow run cannot be used as the
+ * unbounded entrance to the same wallet the direct API caps.
  */
 export async function reserveOrgValue(
   params: ReserveParams
 ): Promise<ReserveResult> {
   return await db.transaction(async (tx) => {
-    const caps = await tx
-      .select({ dailyValueCapWei: organizationSpendCaps.dailyValueCapWei })
-      .from(organizationSpendCaps)
-      .where(eq(organizationSpendCaps.organizationId, params.organizationId))
-      .for("update")
-      .limit(1);
+    const cap = await lockOrgSpendCapRow(tx, params.organizationId);
 
-    const cap = caps[0];
-
-    // No cap configured -> unlimited; record nothing.
-    if (!cap || cap.dailyValueCapWei === null) {
-      return { allowed: true, reservationId: "" } as const;
-    }
+    const usingDefault = cap.dailyValueCapWei === null;
+    const effectiveCap = cap.dailyValueCapWei ?? getDefaultDailyValueCapWei();
 
     const totalWei = await sumOrgValueTodayWei(tx, params.organizationId);
     const reservedWei = BigInt(params.valueWei);
-    const dailyCap = BigInt(cap.dailyValueCapWei);
+    const dailyCap = BigInt(effectiveCap);
+    const exceeded = totalWei + reservedWei > dailyCap;
 
-    if (totalWei + reservedWei > dailyCap) {
+    if (usingDefault && reservedWei > BigInt(0)) {
+      logSecurityEvent("spend_cap_default_applied", {
+        organizationId: params.organizationId,
+        surface: params.source ?? "value-ledger",
+        chainFamily: "evm",
+        reason: cap.created ? "no_cap_row" : "cap_unset_for_chain_family",
+        defaultCap: effectiveCap,
+        reserved: params.valueWei,
+        exceeded,
+      });
+    }
+
+    if (exceeded) {
       return { allowed: false, reason: "Daily spending cap exceeded" } as const;
     }
 
@@ -215,30 +294,34 @@ export async function reserveOrgSolanaValue(
   params: ReserveSolanaParams
 ): Promise<ReserveResult> {
   return await db.transaction(async (tx) => {
-    const caps = await tx
-      .select({
-        dailySolanaValueCapLamports:
-          organizationSpendCaps.dailySolanaValueCapLamports,
-      })
-      .from(organizationSpendCaps)
-      .where(eq(organizationSpendCaps.organizationId, params.organizationId))
-      .for("update")
-      .limit(1);
+    const cap = await lockOrgSpendCapRow(tx, params.organizationId);
 
-    const cap = caps[0];
-
-    if (!cap || cap.dailySolanaValueCapLamports === null) {
-      return { allowed: true, reservationId: "" } as const;
-    }
+    const usingDefault = cap.dailySolanaValueCapLamports === null;
+    const effectiveCap =
+      cap.dailySolanaValueCapLamports ??
+      getDefaultDailySolanaValueCapLamports();
 
     const totalLamports = await sumOrgSolanaValueTodayLamports(
       tx,
       params.organizationId
     );
     const reservedLamports = BigInt(params.valueLamports);
-    const dailyCap = BigInt(cap.dailySolanaValueCapLamports);
+    const dailyCap = BigInt(effectiveCap);
+    const exceeded = totalLamports + reservedLamports > dailyCap;
 
-    if (totalLamports + reservedLamports > dailyCap) {
+    if (usingDefault && reservedLamports > BigInt(0)) {
+      logSecurityEvent("spend_cap_default_applied", {
+        organizationId: params.organizationId,
+        surface: params.source ?? "value-ledger",
+        chainFamily: "solana",
+        reason: cap.created ? "no_cap_row" : "cap_unset_for_chain_family",
+        defaultCap: effectiveCap,
+        reserved: params.valueLamports,
+        exceeded,
+      });
+    }
+
+    if (exceeded) {
       return {
         allowed: false,
         reason: "Daily Solana spending cap exceeded",

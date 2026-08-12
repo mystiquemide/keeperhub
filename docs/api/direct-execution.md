@@ -23,7 +23,24 @@ Direct execution requests are limited to 60 requests per minute per API key. Eve
 
 ## Spending Caps
 
-Organizations can configure daily spending caps in wei. If the cap is exceeded, execution requests return a `403` status with the error message `Daily spending cap exceeded`.
+Two independent daily caps bound the native token **value** an organization moves (gas is not counted against them):
+
+| Cap | Unit | Applies to |
+| --- | --- | --- |
+| `dailyValueCapWei` | wei | every EVM chain |
+| `dailySolanaValueCapLamports` | lamports | Solana |
+
+**Every organization is capped, including one that has never configured anything.** An organization that has set no cap of its own, or that clears one, gets the platform default for that chain family rather than unlimited spending. There is no uncapped state: raising the ceiling means setting a higher number, not leaving the field empty. The defaults are `0.05 ETH` per day for EVM chains and `1 SOL` per day for Solana; self-hosted deployments can change them with the `EXECUTE_DEFAULT_DAILY_VALUE_CAP_WEI` and `EXECUTE_DEFAULT_DAILY_SOLANA_VALUE_CAP_LAMPORTS` environment variables.
+
+Both caps count value moved by workflow runs as well as by this API, so the two cannot be used to double-spend the same daily budget. Exceeding one returns `403` with `Daily spending cap exceeded` (or `Daily Solana spending cap exceeded`).
+
+Call `GET /api/analytics/spend-cap` before planning a large transfer. Read `effectiveDailyCapWei` and `effectiveDailySolanaCapLamports` — those are the figures enforcement uses. A null `dailyCapWei` means the organization configured nothing, not that spending is unbounded.
+
+### Stablecoin transfers
+
+An ERC-20 transfer carries no native value, so the daily caps above cannot see it. A single transaction that moves a recognised stablecoin (any token listed for that chain and flagged as a stablecoin) is limited to **200 USD**, applying the 1:1 peg to the token's own decimals. The limit is per transaction rather than per day, and covers every write path: `/api/execute/transfer`, `/api/execute/contract-call`, protocol actions, `/api/execute/node`, and the equivalent workflow steps. Over the limit nothing is signed or broadcast; the request completes as a failed execution (`202` with `status: "failed"`) whose error reads `Stablecoin transfer of ... exceeds the 200.0 USD per-transaction limit`. Self-hosted deployments can change the figure with `EXECUTE_DEFAULT_STABLECOIN_CAP_MICRO_USD` (micro-USD, so `200000000` is 200 USD).
+
+Two things this does **not** do: it does not price non-stablecoin ERC-20s, which are not bounded at all, and it does not refuse `approve` — a large stablecoin approval is recorded but allowed, because capping approvals would break routine protocol integrations.
 
 ## Safe First-Write Sequence
 
@@ -694,7 +711,7 @@ Direct execution endpoints return detailed error information:
 **Common Error Codes:**
 
 - `401`: Invalid or missing API key
-- `403`: The daily spending cap is exceeded, or an OAuth token lacks the scope the request needs (`insufficient_scope`). API keys are unaffected by scope.
+- `403`: The daily spending cap is exceeded, or an OAuth token lacks the scope the request needs (`insufficient_scope`). API keys are unaffected by scope. See [Spending Caps](#spending-caps) — an organization that never configured a cap is still subject to the platform default.
 - `422`: Wallet not configured, code `WALLET_NOT_CONFIGURED` (see [Wallet Management](/wallet-management/turnkey))
 - `429`: Rate limit exceeded
 - `400`: Invalid request parameters

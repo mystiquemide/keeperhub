@@ -9,6 +9,12 @@ import { cn } from "@/lib/utils";
 type SpendCapData = {
   dailyCapWei: string | null;
   dailyUsedWei: string;
+  // The cap enforcement actually applies: the org's own figure when it set one,
+  // otherwise the platform default. An org that has configured nothing is still
+  // capped, so gauging against dailyCapWei alone would show no ceiling while
+  // requests were being refused.
+  effectiveDailyCapWei: string;
+  usingDefaultDailyCap: boolean;
 };
 
 function weiToEth(weiString: string): number {
@@ -106,19 +112,19 @@ export function SpendCapGauge(): ReactNode {
       );
     }
 
-    if (!data?.dailyCapWei) {
+    if (!data?.effectiveDailyCapWei) {
       return (
         <div className="flex flex-col items-center gap-2 py-4 text-center">
           <Fuel className="size-8 text-muted-foreground/40" />
           <p className="text-sm text-muted-foreground">
-            No spend cap configured
+            Unable to load spend cap data
           </p>
         </div>
       );
     }
 
     const usedEth = weiToEth(data.dailyUsedWei);
-    const capEth = weiToEth(data.dailyCapWei);
+    const capEth = weiToEth(data.effectiveDailyCapWei);
     const percentage = capEth > 0 ? Math.min((usedEth / capEth) * 100, 100) : 0;
 
     return (
@@ -146,6 +152,9 @@ export function SpendCapGauge(): ReactNode {
 
         <p className="text-xs text-muted-foreground">
           {getSpendCapMessage(percentage)}
+          {data.usingDefaultDailyCap
+            ? " (platform default -- set your own cap to change it)"
+            : ""}
         </p>
       </div>
     );

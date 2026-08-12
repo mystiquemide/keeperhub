@@ -12,6 +12,7 @@ const state = vi.hoisted(() => ({
   sumRows: [] as Array<{ totalWei?: string; totalLamports?: string }>,
   ledgerRows: [] as Array<{ totalWei?: string; totalLamports?: string }>,
   inserted: [] as Record<string, unknown>[],
+  capAnchors: [] as Record<string, unknown>[],
   updated: [] as Record<string, unknown>[],
   paygCharge: { applicable: false } as
     | { applicable: false }
@@ -19,18 +20,29 @@ const state = vi.hoisted(() => ({
     | { applicable: true; ok: false; reason: string; message: string },
 }));
 
+// A cap-row insert carries nothing but the org id: lockOrgSpendCapRow creates
+// the row purely as a lock anchor, with both cap columns left NULL.
+function isCapAnchorInsert(values: Record<string, unknown>): boolean {
+  return Object.keys(values).length === 1 && "organizationId" in values;
+}
+
 // Fake db.transaction whose tx supports what the reservation uses: the cap
-// FOR UPDATE lookup (.for().limit()), the value SUM -- now two thenable
-// .where() selects (direct executions, then the value ledger) via
-// sumOrgValueTodayWei -- and the reservation insert.
+// FOR UPDATE lookup (.for().limit()), recognised by the columns it selects
+// because lockOrgSpendCapRow may run it twice; the anchor insert when the org
+// has no row; the value SUM -- two thenable .where() selects (direct
+// executions, then the value ledger) via sumOrgValueTodayWei -- and the
+// reservation insert.
 vi.mock("@/lib/db", () => ({
   db: {
     transaction: (cb: (tx: unknown) => unknown) => {
-      let selectCall = 0;
+      let sumCall = 0;
       const tx = {
-        select: () => {
-          selectCall += 1;
-          if (selectCall === 1) {
+        select: (fields: Record<string, unknown>) => {
+          const columns = Object.keys(fields ?? {});
+          if (
+            columns.includes("dailyValueCapWei") ||
+            columns.includes("dailySolanaValueCapLamports")
+          ) {
             return {
               from: () => ({
                 where: () => ({
@@ -41,8 +53,8 @@ vi.mock("@/lib/db", () => ({
               }),
             };
           }
-          // select #2 = direct-executions SUM, select #3 = ledger SUM.
-          const rows = selectCall === 2 ? state.sumRows : state.ledgerRows;
+          sumCall += 1;
+          const rows = sumCall === 1 ? state.sumRows : state.ledgerRows;
           return {
             from: () => ({
               where: () => Promise.resolve(rows),
@@ -51,6 +63,20 @@ vi.mock("@/lib/db", () => ({
         },
         insert: () => ({
           values: (v: Record<string, unknown>) => {
+            if (isCapAnchorInsert(v)) {
+              state.capAnchors.push(v);
+              return {
+                onConflictDoNothing: () => {
+                  state.caps = [
+                    {
+                      dailyValueCapWei: null,
+                      dailySolanaValueCapLamports: null,
+                    },
+                  ];
+                  return Promise.resolve(undefined);
+                },
+              };
+            }
             state.inserted.push(v);
             return Promise.resolve(undefined);
           },
@@ -77,6 +103,13 @@ vi.mock("@/lib/billing/payg/charge", () => ({
 }));
 
 import { checkAndReserveExecution } from "@/app/api/execute/_lib/spending-cap";
+import {
+  getDefaultDailySolanaValueCapLamports,
+  getDefaultDailyValueCapWei,
+} from "@/lib/execute/spend-cap-defaults";
+
+const DEFAULT_WEI = BigInt(getDefaultDailyValueCapWei());
+const DEFAULT_LAMPORTS = BigInt(getDefaultDailySolanaValueCapLamports());
 
 const baseParams = {
   organizationId: "org_1",
@@ -91,12 +124,26 @@ beforeEach(() => {
   state.sumRows = [{ totalWei: "0" }];
   state.ledgerRows = [{ totalWei: "0" }];
   state.inserted = [];
+  state.capAnchors = [];
   state.updated = [];
   state.paygCharge = { applicable: false };
 });
 
+describe("platform default cap figures", () => {
+  // Pinned so a change to the policy is a deliberate test edit rather than a
+  // silent widening. Every other test derives its expectations from these
+  // getters, so without this nothing would catch an added zero.
+  it("is 0.05 ETH per day for EVM chains", () => {
+    expect(getDefaultDailyValueCapWei()).toBe("50000000000000000");
+  });
+
+  it("is 1 SOL per day for Solana", () => {
+    expect(getDefaultDailySolanaValueCapLamports()).toBe("1000000000");
+  });
+});
+
 describe("checkAndReserveExecution value cap", () => {
-  it("allows and records the reserved value when no cap row exists (unlimited)", async () => {
+  it("allows a value under the platform default when no cap row exists", async () => {
     state.caps = [];
 
     const result = await checkAndReserveExecution({
@@ -112,12 +159,67 @@ describe("checkAndReserveExecution value cap", () => {
     });
   });
 
-  it("treats a null dailyValueCapWei as unlimited", async () => {
-    state.caps = [{ dailyValueCapWei: null }];
+  it("denies above the platform default when no cap row exists", async () => {
+    // The historical fail-open: every org started without a cap row, so a
+    // leaked key was bounded only by the wallet balance.
+    state.caps = [];
 
     const result = await checkAndReserveExecution({
       ...baseParams,
+      reserved: { kind: "evm", valueWei: (DEFAULT_WEI + BigInt(1)).toString() },
+    });
+
+    expect(result).toEqual({
+      allowed: false,
+      reason: "Daily spending cap exceeded",
+    });
+    expect(state.inserted).toHaveLength(0);
+  });
+
+  it("creates the cap row so the FOR UPDATE lock has something to hold", async () => {
+    state.caps = [];
+
+    await checkAndReserveExecution({
+      ...baseParams,
+      reserved: { kind: "evm", valueWei: "5" },
+    });
+
+    expect(state.capAnchors).toEqual([{ organizationId: "org_1" }]);
+    // The anchor carries no cap figures, so the org keeps tracking the platform
+    // default rather than freezing today's value into its row.
+    expect(state.caps).toEqual([
+      { dailyValueCapWei: null, dailySolanaValueCapLamports: null },
+    ]);
+  });
+
+  it("applies the platform default when dailyValueCapWei is null", async () => {
+    state.caps = [{ dailyValueCapWei: null }];
+
+    const under = await checkAndReserveExecution({
+      ...baseParams,
       reserved: { kind: "evm", valueWei: "999" },
+    });
+    expect(under.allowed).toBe(true);
+    expect(state.inserted).toHaveLength(1);
+
+    const over = await checkAndReserveExecution({
+      ...baseParams,
+      reserved: { kind: "evm", valueWei: (DEFAULT_WEI + BigInt(1)).toString() },
+    });
+    expect(over.allowed).toBe(false);
+    expect(state.inserted).toHaveLength(1);
+  });
+
+  it("lets an explicit cap raise the ceiling above the platform default", async () => {
+    const raised = (DEFAULT_WEI * BigInt(100)).toString();
+    state.caps = [{ dailyValueCapWei: raised }];
+
+    const result = await checkAndReserveExecution({
+      ...baseParams,
+      reserved: {
+        kind: "evm",
+        valueWei: (DEFAULT_WEI * BigInt(10)).toString(),
+      },
     });
 
     expect(result.allowed).toBe(true);
@@ -229,20 +331,33 @@ describe("checkAndReserveExecution Solana cap", () => {
     expect(state.inserted).toHaveLength(0);
   });
 
-  it("treats an unset Solana cap as unlimited and does NOT fall back to the wei cap", async () => {
-    // A wei cap that would reject this figure outright, to prove the Solana
-    // path never consults it.
+  it("falls back to the Solana default when unset, never to the wei cap", async () => {
+    // A wei cap that would reject either figure outright, to prove the Solana
+    // path never consults it: the small reservation is allowed and the large
+    // one is denied purely by the Solana default.
     state.caps = [{ dailyValueCapWei: "1", dailySolanaValueCapLamports: null }];
     state.sumRows = [{ totalLamports: "0" }];
     state.ledgerRows = [{ totalLamports: "0" }];
 
-    const result = await checkAndReserveExecution({
+    const under = await checkAndReserveExecution({
       ...baseParams,
       network: "103",
-      reserved: { kind: "solana", valueLamports: "5000000000" },
+      reserved: { kind: "solana", valueLamports: "5000" },
     });
+    expect(under.allowed).toBe(true);
 
-    expect(result.allowed).toBe(true);
+    const over = await checkAndReserveExecution({
+      ...baseParams,
+      network: "103",
+      reserved: {
+        kind: "solana",
+        valueLamports: (DEFAULT_LAMPORTS + BigInt(1)).toString(),
+      },
+    });
+    expect(over).toEqual({
+      allowed: false,
+      reason: "Daily Solana spending cap exceeded",
+    });
   });
 
   it("does not let an exhausted wei cap block a Solana reservation", async () => {

@@ -766,9 +766,17 @@ export type NewIdempotencyRecord = typeof idempotencyRecords.$inferInsert;
  * accounted at its true 9-decimal precision instead of being scaled to 18
  * decimals to share the ETH cap.
  *
- * When no row exists for an org, or the relevant cap column is null, spending
- * of that kind is unlimited (no cap enforced). The two caps are independent:
- * a null Solana cap does not fall back to the wei cap.
+ * When no row exists for an org, or the relevant cap column is null, the
+ * platform default in `lib/execute/spend-cap-defaults.ts` applies -- there is
+ * no "unlimited" state, because an org that has never opened the settings page
+ * is indistinguishable from one that deliberately wanted no ceiling. The two
+ * caps are independent: a null Solana cap falls back to the Solana default,
+ * not to the wei cap.
+ *
+ * A row with both cap columns NULL is therefore normal, not a mistake: the
+ * reservation paths create one on an org's first value-moving request purely so
+ * `SELECT ... FOR UPDATE` has something to lock (see lockOrgSpendCapRow in
+ * lib/execute/value-ledger.ts).
  */
 export const organizationSpendCaps = pgTable("organization_spend_caps", {
   id: text("id")

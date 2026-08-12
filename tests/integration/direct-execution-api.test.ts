@@ -376,6 +376,30 @@ describe("Direct Execution API", () => {
       );
     });
 
+    it("surfaces a stablecoin-ceiling refusal from the core as a failed execution", async () => {
+      // The ceiling lives in transferTokenCore, not in this route, so that the
+      // contract-call, protocol, node and workflow entrances are covered by the
+      // same check. The route's job is to report the refusal without
+      // broadcasting anything.
+      setupPassingGuards();
+      const error =
+        "Stablecoin transfer of 5000.0 USDC exceeds the 200.0 USD per-transaction limit";
+      mocks.transferTokenCore.mockResolvedValue({ success: false, error });
+      mocks.failExecution.mockResolvedValue({ status: "failed" });
+
+      const response = await transferPOST(
+        postRequest("/transfer", {
+          ...validBody,
+          tokenAddress: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        })
+      );
+
+      const data = await response.json();
+      expect(data.status).toBe("failed");
+      expect(data.error).toBe(error);
+      expect(data.transactionHash).toBeUndefined();
+    });
+
     it("returns 400 for an unparseable native amount before reserving", async () => {
       setupPassingGuards();
 

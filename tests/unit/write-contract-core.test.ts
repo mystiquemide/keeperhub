@@ -4,6 +4,16 @@ const DIRECT_ID_PREFIX_REGEX = /^direct-/;
 
 vi.mock("server-only", () => ({}));
 
+// supported_tokens rows the stablecoin ceiling reads, set per test.
+const registry = vi.hoisted(() => ({
+  tokenRows: [] as Array<{
+    tokenAddress: string;
+    decimals: number;
+    symbol: string;
+    isStablecoin: boolean;
+  }>,
+}));
+
 vi.mock("@/lib/workflow/executor/step-handler", () => ({
   withStepLogging: (_input: unknown, fn: () => unknown) => fn(),
 }));
@@ -21,15 +31,19 @@ vi.mock("@/lib/logging", () => ({
   },
   logUserError: vi.fn(),
   logSystemWarn: vi.fn(),
+  logSecurityEvent: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
   db: {
     select: () => ({
       from: () => ({
-        where: () => ({
-          limit: () => Promise.resolve([]),
-        }),
+        // The stablecoin ceiling awaits where() directly (it reads the chain's
+        // whole token list); other lookups end in limit().
+        where: () =>
+          Object.assign(Promise.resolve(registry.tokenRows), {
+            limit: () => Promise.resolve([]),
+          }),
       }),
     }),
   },
@@ -37,6 +51,13 @@ vi.mock("@/lib/db", () => ({
 
 vi.mock("@/lib/db/schema", () => ({
   workflowExecutions: { id: "id", userId: "userId", workflowId: "workflowId" },
+  supportedTokens: {
+    chainId: "chainId",
+    tokenAddress: "tokenAddress",
+    decimals: "decimals",
+    symbol: "symbol",
+    isStablecoin: "isStablecoin",
+  },
 }));
 
 vi.mock("drizzle-orm", () => ({
@@ -85,6 +106,7 @@ vi.mock("@/lib/explorer", () => ({
 
 vi.mock("@/lib/abi/struct-args", () => ({
   reshapeArgsForAbi: vi.fn().mockImplementation((args: unknown[]) => args),
+  coerceArgsForAbi: vi.fn().mockImplementation((args: unknown[]) => args),
 }));
 
 vi.mock("@/lib/abi/function-key", () => ({
@@ -218,10 +240,81 @@ const MOCK_EXECUTED_CALL = {
   reverted: false,
 };
 
+const USDC_CONTRACT = "0x1234567890123456789012345678901234567890";
+
+describe("writeContractCore stablecoin ceiling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    capturedTxContext = null;
+    registry.tokenRows = [];
+  });
+
+  it("refuses an over-cap USDC transfer routed through a raw contract call", async () => {
+    // The contract-call, protocol-action, check-and-execute and node APIs all
+    // reach this core with a caller-supplied address, ABI and args, and they
+    // reserve only native value -- which an ERC-20 transfer does not carry. A
+    // ceiling on the transfer route alone would just have said which door to
+    // use.
+    registry.tokenRows = [
+      {
+        tokenAddress: USDC_CONTRACT,
+        decimals: 6,
+        symbol: "USDC",
+        isStablecoin: true,
+      },
+    ];
+
+    const result = await writeContractCore({
+      contractAddress: USDC_CONTRACT,
+      network: "ethereum",
+      abi: VALID_ABI,
+      abiFunction: "transfer",
+      functionArgs: JSON.stringify([
+        "0x1111111111111111111111111111111111111111",
+        "10000000000",
+      ]),
+      _context: { organizationId: "org-1" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("per-transaction limit");
+    }
+    // Refused before the wallet is even resolved, so nothing is signed.
+    expect(initializeWalletSigner).not.toHaveBeenCalled();
+  });
+
+  it("allows an under-cap USDC transfer through the same path", async () => {
+    registry.tokenRows = [
+      {
+        tokenAddress: USDC_CONTRACT,
+        decimals: 6,
+        symbol: "USDC",
+        isStablecoin: true,
+      },
+    ];
+
+    const result = await writeContractCore({
+      contractAddress: USDC_CONTRACT,
+      network: "ethereum",
+      abi: VALID_ABI,
+      abiFunction: "transfer",
+      functionArgs: JSON.stringify([
+        "0x1111111111111111111111111111111111111111",
+        "1000000",
+      ]),
+      _context: { organizationId: "org-1" },
+    });
+
+    expect(result.success).toBe(true);
+  });
+});
+
 describe("writeContractCore executedCall on direct send", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     capturedTxContext = null;
+    registry.tokenRows = [];
     mockTraceExecutedCall.mockResolvedValue(undefined);
   });
 

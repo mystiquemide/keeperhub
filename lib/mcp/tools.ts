@@ -1823,7 +1823,7 @@ export function registerTools(
 
   server.tool(
     "get_spending_limits",
-    "Get the organization's daily direct-execution spending caps and current usage (EVM wei and Solana lamports).",
+    "Get the organization's daily direct-execution spending caps and current usage (EVM wei and Solana lamports). Plan against effectiveDailyCapWei / effectiveDailySolanaCapLamports: those are what is enforced. A null dailyCapWei means the organization set no cap of its own, NOT that spending is unlimited -- the platform default applies and requests above it are refused.",
     {},
     {
       title: "Get Spending Limits",

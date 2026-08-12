@@ -16,6 +16,7 @@ import {
   supportedTokens,
   workflowExecutions,
 } from "@/lib/db/schema";
+import { checkStablecoinTransferAmount } from "@/lib/execute/stablecoin-cap";
 import { getTransactionUrl } from "@/lib/explorer";
 import { ErrorCategory, logUserError } from "@/lib/logging";
 import {
@@ -304,6 +305,21 @@ export async function transferTokenCore(
   }
 
   const { organizationId, userId } = orgCtx;
+
+  // Stablecoin ceiling. An ERC-20 transfer carries a native value of 0, so the
+  // daily value cap reserves nothing for it and cannot see it at all. Checked
+  // here rather than in the calling route so every entrance is covered: the
+  // direct transfer API, the node-execution API, and the workflow step.
+  const stablecoinCap = await checkStablecoinTransferAmount({
+    organizationId,
+    chainId,
+    tokenAddress,
+    amount,
+    context: "transfer-token",
+  });
+  if (stablecoinCap.kind !== "allowed") {
+    return { success: false, error: stablecoinCap.error };
+  }
 
   // Resolve RPC config (with failover)
   let rpcUrl: string;

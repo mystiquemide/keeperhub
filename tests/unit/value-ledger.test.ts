@@ -18,23 +18,34 @@ const state = vi.hoisted(() => ({
     totalLamports: string;
   }>,
   inserted: [] as Record<string, unknown>[],
+  capAnchors: [] as Record<string, unknown>[],
   updates: [] as Record<string, unknown>[],
   returningId: "res_1",
   reserveKind: "evm" as "evm" | "solana",
 }));
 
-// Fake db: transaction whose tx serves the cap FOR UPDATE lookup, then the two
-// SUM selects (direct executions, then the value ledger) that
-// sumOrgValueTodayWei runs, then the reservation insert (.returning). update()
-// records the settle/release status.
+// A cap-row insert carries nothing but the org id: lockOrgSpendCapRow creates
+// the row purely as a lock anchor, with both cap columns left NULL.
+function isCapAnchorInsert(values: Record<string, unknown>): boolean {
+  return Object.keys(values).length === 1 && "organizationId" in values;
+}
+
+// Fake db: transaction whose tx serves the cap FOR UPDATE lookup (recognised by
+// the selected columns, since lockOrgSpendCapRow may run it twice), the anchor
+// insert when the org has no row, the two SUM selects (direct executions, then
+// the value ledger) that sumOrgValueTodayWei runs, and the reservation insert
+// (.returning). update() records the settle/release status.
 vi.mock("@/lib/db", () => ({
   db: {
     transaction: (cb: (tx: unknown) => unknown) => {
-      let selectCall = 0;
+      let sumCall = 0;
       const tx = {
-        select: () => {
-          selectCall += 1;
-          if (selectCall === 1) {
+        select: (fields: Record<string, unknown>) => {
+          const columns = Object.keys(fields ?? {});
+          if (
+            columns.includes("dailyValueCapWei") ||
+            columns.includes("dailySolanaValueCapLamports")
+          ) {
             return {
               from: () => ({
                 where: () => ({
@@ -45,8 +56,9 @@ vi.mock("@/lib/db", () => ({
               }),
             };
           }
+          sumCall += 1;
           let rows: Array<{ totalWei: string } | { totalLamports: string }>;
-          if (selectCall === 2) {
+          if (sumCall === 1) {
             rows =
               state.reserveKind === "solana"
                 ? state.directLamportsSum
@@ -63,6 +75,20 @@ vi.mock("@/lib/db", () => ({
         },
         insert: () => ({
           values: (v: Record<string, unknown>) => {
+            if (isCapAnchorInsert(v)) {
+              state.capAnchors.push(v);
+              return {
+                onConflictDoNothing: () => {
+                  state.caps = [
+                    {
+                      dailyValueCapWei: null,
+                      dailySolanaValueCapLamports: null,
+                    },
+                  ];
+                  return Promise.resolve(undefined);
+                },
+              };
+            }
             state.inserted.push(v);
             return {
               returning: () => Promise.resolve([{ id: state.returningId }]),
@@ -84,6 +110,10 @@ vi.mock("@/lib/db", () => ({
 }));
 
 import {
+  getDefaultDailySolanaValueCapLamports,
+  getDefaultDailyValueCapWei,
+} from "@/lib/execute/spend-cap-defaults";
+import {
   reserveOrgSolanaValue,
   reserveOrgValue,
   withSolanaValueCap,
@@ -93,6 +123,8 @@ import {
 
 const ONE_ETH_WEI = "1000000000000000000";
 const ONE_SOL_LAMPORTS = "1000000000";
+const DEFAULT_WEI = BigInt(getDefaultDailyValueCapWei());
+const DEFAULT_LAMPORTS = BigInt(getDefaultDailySolanaValueCapLamports());
 
 beforeEach(() => {
   state.caps = [];
@@ -101,13 +133,14 @@ beforeEach(() => {
   state.directLamportsSum = [{ totalLamports: "0" }];
   state.ledgerLamportsSum = [{ totalLamports: "0" }];
   state.inserted = [];
+  state.capAnchors = [];
   state.updates = [];
   state.returningId = "res_1";
   state.reserveKind = "evm";
 });
 
 describe("reserveOrgValue", () => {
-  it("is unlimited (records nothing) when no cap row exists", async () => {
+  it("applies the platform default when no cap row exists", async () => {
     state.caps = [];
 
     const result = await reserveOrgValue({
@@ -115,11 +148,28 @@ describe("reserveOrgValue", () => {
       valueWei: "500",
     });
 
-    expect(result).toEqual({ allowed: true, reservationId: "" });
+    expect(result).toEqual({ allowed: true, reservationId: "res_1" });
+    expect(state.inserted).toHaveLength(1);
+  });
+
+  it("denies above the platform default when no cap row exists", async () => {
+    // Without this the workflow path would stay the unbounded entrance to the
+    // same wallet the direct-execution API caps.
+    state.caps = [];
+
+    const result = await reserveOrgValue({
+      organizationId: "org_1",
+      valueWei: (DEFAULT_WEI + BigInt(1)).toString(),
+    });
+
+    expect(result).toEqual({
+      allowed: false,
+      reason: "Daily spending cap exceeded",
+    });
     expect(state.inserted).toHaveLength(0);
   });
 
-  it("treats a null daily value cap as unlimited", async () => {
+  it("applies the platform default when the daily value cap is null", async () => {
     state.caps = [{ dailyValueCapWei: null }];
 
     const result = await reserveOrgValue({
@@ -127,7 +177,10 @@ describe("reserveOrgValue", () => {
       valueWei: ONE_ETH_WEI,
     });
 
-    expect(result).toEqual({ allowed: true, reservationId: "" });
+    expect(result).toEqual({
+      allowed: false,
+      reason: "Daily spending cap exceeded",
+    });
     expect(state.inserted).toHaveLength(0);
   });
 
@@ -166,6 +219,30 @@ describe("reserveOrgValue", () => {
       reason: "Daily spending cap exceeded",
     });
     expect(state.inserted).toHaveLength(0);
+  });
+
+  it("creates the cap row so the FOR UPDATE lock has something to hold", async () => {
+    // SELECT ... FOR UPDATE locks no rows when the row is absent, and "absent"
+    // is every org this default newly covers. Without an anchor row, concurrent
+    // callers would each read a zero total and each reserve the full default.
+    state.caps = [];
+
+    await reserveOrgValue({ organizationId: "org_1", valueWei: "500" });
+
+    expect(state.capAnchors).toEqual([{ organizationId: "org_1" }]);
+    // The anchor carries no cap figures: it must not freeze today's default
+    // into the org's row.
+    expect(state.caps).toEqual([
+      { dailyValueCapWei: null, dailySolanaValueCapLamports: null },
+    ]);
+  });
+
+  it("does not create a second cap row once one exists", async () => {
+    state.caps = [{ dailyValueCapWei: "1000" }];
+
+    await reserveOrgValue({ organizationId: "org_1", valueWei: "100" });
+
+    expect(state.capAnchors).toHaveLength(0);
   });
 
   it("counts prior direct-execution spend in its own SUM", async () => {
@@ -475,16 +552,24 @@ describe("reserveOrgSolanaValue", () => {
     state.reserveKind = "solana";
   });
 
-  it("is unlimited when no Solana cap row exists", async () => {
+  it("applies the platform default when no Solana cap row exists", async () => {
     state.caps = [];
 
-    const result = await reserveOrgSolanaValue({
+    const under = await reserveOrgSolanaValue({
       organizationId: "org_1",
       valueLamports: "500",
     });
+    expect(under).toEqual({ allowed: true, reservationId: "res_1" });
 
-    expect(result).toEqual({ allowed: true, reservationId: "" });
-    expect(state.inserted).toHaveLength(0);
+    const over = await reserveOrgSolanaValue({
+      organizationId: "org_1",
+      valueLamports: (DEFAULT_LAMPORTS + BigInt(1)).toString(),
+    });
+    expect(over).toEqual({
+      allowed: false,
+      reason: "Daily Solana spending cap exceeded",
+    });
+    expect(state.inserted).toHaveLength(1);
   });
 
   it("allows and inserts a reserved lamports row within the cap", async () => {

@@ -56,11 +56,12 @@ Track performance at the node level:
 
 ## Spending Caps
 
-Organizations can configure a daily cap on the native token value moved by direct executions (transfers), independent of gas:
+A daily cap bounds the native token value moved by executions (transfers), independent of gas:
 
-- Set the maximum daily value in wei
-- Monitor current usage against the cap
-- Automatic enforcement on direct executions
+- Set the maximum daily value in wei for EVM chains, or lamports for Solana
+- Every organization is capped: leaving a cap unset, or clearing it, applies the platform default rather than removing the ceiling
+- Monitor current usage against the effective cap
+- Automatic enforcement on direct executions and on workflow runs, against the same daily budget
 - Real-time spending alerts
 
 See [Analytics API](/api/analytics) for details on accessing spending cap data programmatically.

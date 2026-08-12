@@ -75,7 +75,8 @@ function CapControl({
   }, [cap, decimals]);
 
   const handleSave = useCallback(() => {
-    // An empty field clears the cap, matching the "Leave empty for no cap" hint.
+    // An empty field clears the org's own cap, which hands the chain family
+    // back to the platform default.
     if (input.trim() === "") {
       onSave(null);
       return;
@@ -108,7 +109,7 @@ function CapControl({
       <p className="text-muted-foreground text-xs">
         {cap
           ? `Current cap: ${formatBase(cap, decimals)} ${symbol}/day - used ${usedDisplay} ${symbol} today`
-          : `No cap set - used ${usedDisplay} ${symbol} today`}
+          : `No cap set - the platform default applies - used ${usedDisplay} ${symbol} today`}
       </p>
       <div className="flex gap-2">
         <Button
@@ -195,7 +196,9 @@ export function SpendCapSection(): React.ReactElement {
             setCapLamports(base);
           }
           toast.success(
-            base ? "Daily value cap saved" : "Daily value cap cleared"
+            base
+              ? "Daily value cap saved"
+              : "Daily value cap reset to the platform default"
           );
         } else if (res.status === 403) {
           toast.error("Only organization owners and admins can change the cap");
@@ -228,8 +231,8 @@ export function SpendCapSection(): React.ReactElement {
       <p className="text-muted-foreground text-xs">
         Limits the total native value that direct execution API calls and
         workflow runs can move per day for this organization. EVM and Solana are
-        capped separately, in their own currencies. Leave a field empty for no
-        cap.
+        capped separately, in their own currencies. Leave a field empty to fall
+        back to the platform default; there is no uncapped setting.
       </p>
 
       <CapControl
