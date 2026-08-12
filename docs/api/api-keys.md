@@ -78,11 +78,14 @@ POST /api/keys
 ```json
 {
   "name": "My API Key",
-  "expiresAt": "2025-01-01T00:00:00Z"
+  "expiresAt": "2025-01-01T00:00:00Z",
+  "scopes": ["mcp:read", "mcp:write"]
 }
 ```
 
 `expiresAt` is optional. Omit for a non-expiring key.
+
+`scopes` is optional and accepts either an array of scope strings or a single space-separated string. Valid values are `mcp:read`, `mcp:write`, and `mcp:admin`; unrecognized entries are dropped, and a request whose entries are all unrecognized falls back to `mcp:read` rather than granting more. The scope is enforced on every endpoint that declares a requirement, including the [Direct Execution API](/api/direct-execution) - a key scoped `mcp:read` can read and simulate but cannot broadcast, and receives `403` with `error: "insufficient_scope"` if it tries. Omit `scopes` entirely for a key with no scope restriction, which passes every gate. The scope a key was created with is returned by the List endpoint and cannot be changed afterwards; create a new key instead.
 
 #### Response
 

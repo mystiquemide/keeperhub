@@ -17,6 +17,8 @@ Authorization: Bearer kh_your_api_key
 
 See [Authentication](/api/authentication) for the full auth model and [API Keys](/api/api-keys) for details on creating and managing API keys.
 
+Scope is enforced on these endpoints. A key created with `mcp:read` only can read execution status and run dry-run simulations, but is refused with `403 insufficient_scope` when it tries to broadcast. Broadcasting needs `mcp:write` or `mcp:admin`. A key created without any scope has no scope restriction and passes every gate; the same rules apply to MCP OAuth tokens.
+
 ## Rate Limits
 
 Direct execution requests are limited to 60 requests per minute per API key. Every response carries `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` so you can pace requests; a `429` adds `Retry-After` with the seconds to wait. See [API errors](errors.md#rate-limit-headers) for the full header reference.
@@ -478,7 +480,7 @@ Add `"simulate": true` to any of the standard request bodies:
 
 `simulate` must be a strict boolean — `true` or `false`. Strings (`"true"`), numbers (`1`), and other non-boolean values are rejected with HTTP 400 to prevent silent fall-through to a real broadcast. There is no query-string form; the body field is the only way to request a dry run.
 
-Because a dry run never signs or broadcasts, an OAuth token scoped `mcp:read` may run one. Removing `simulate` to broadcast requires `mcp:write`.
+Because a dry run never signs or broadcasts, a credential scoped `mcp:read` may run one. Removing `simulate` to broadcast requires `mcp:write`.
 
 ### Response — successful simulate
 
@@ -694,7 +696,7 @@ Direct execution endpoints return detailed error information:
 **Common Error Codes:**
 
 - `401`: Invalid or missing API key
-- `403`: The daily spending cap is exceeded, or an OAuth token lacks the scope the request needs (`insufficient_scope`). API keys are unaffected by scope.
+- `403`: The daily spending cap is exceeded, or the credential lacks the scope the request needs (`insufficient_scope`). Scope is enforced for both OAuth tokens and organization API keys. A key created without a scope has no scope restriction and passes every gate.
 - `422`: Wallet not configured, code `WALLET_NOT_CONFIGURED` (see [Wallet Management](/wallet-management/turnkey))
 - `429`: Rate limit exceeded
 - `400`: Invalid request parameters

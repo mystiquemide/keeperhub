@@ -39,6 +39,8 @@ vi.mock("@/lib/workflow/access", () => ({
 vi.mock("@/lib/logging", () => ({
   ErrorCategory: { DATABASE: "database" },
   logSystemError: vi.fn(),
+  // requireScope emits this on every denial, which is what this suite asserts.
+  logSecurityEvent: vi.fn(),
 }));
 
 const ROUTE = "@/app/api/executions/[executionId]/cancel/route";

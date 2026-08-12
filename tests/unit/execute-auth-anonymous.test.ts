@@ -112,4 +112,44 @@ describe("validateApiKey -- anonymous and failure propagation", () => {
 
     expect(result).toEqual({ organizationId: "org-2", apiKeyId: "key-1" });
   });
+
+  it("propagates the scope an API key was minted with", async () => {
+    mockAuthenticateOAuthToken.mockResolvedValue({
+      authenticated: false,
+      statusCode: 401,
+    });
+    mockAuthenticateApiKey.mockResolvedValue({
+      authenticated: true,
+      organizationId: "org-2",
+      apiKeyId: "key-1",
+      userId: "user-2",
+      scope: "mcp:read",
+    });
+
+    const result = await validateApiKey(request());
+
+    expect(result).toEqual({
+      organizationId: "org-2",
+      apiKeyId: "key-1",
+      scope: "mcp:read",
+    });
+  });
+
+  it("leaves scope undefined for a key whose scope column is NULL", async () => {
+    mockAuthenticateOAuthToken.mockResolvedValue({
+      authenticated: false,
+      statusCode: 401,
+    });
+    mockAuthenticateApiKey.mockResolvedValue({
+      authenticated: true,
+      organizationId: "org-2",
+      apiKeyId: "key-1",
+      scope: undefined,
+    });
+
+    const result = await validateApiKey(request());
+
+    expect(result).not.toHaveProperty("error");
+    expect((result as { scope?: string }).scope).toBeUndefined();
+  });
 });

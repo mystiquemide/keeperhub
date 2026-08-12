@@ -273,7 +273,12 @@ export async function POST(request: Request): Promise<NextResponse> {
   // rejected above rather than downgrading the requirement.
   const scopeError = requireScope(
     apiKeyCtx.scope,
-    simulateFlag.simulate ? SCOPE_MCP_READ : SCOPE_MCP_WRITE
+    simulateFlag.simulate ? SCOPE_MCP_READ : SCOPE_MCP_WRITE,
+    {
+      organizationId: apiKeyCtx.organizationId,
+      credentialId: apiKeyCtx.apiKeyId,
+      endpoint: "/api/execute/contract-call",
+    }
   );
   if (scopeError) {
     return scopeError;

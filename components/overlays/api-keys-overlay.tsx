@@ -52,9 +52,14 @@ type ApiKeysOverlayProps = OverlayComponentProps<{
   onKeyCreated?: (key: string, type: "webhook" | "organisation") => void;
 }>;
 
+// Read is genuinely read-only at the API layer: it is refused with 403 at the
+// direct-execution endpoints. Say so here, because a key created with Write
+// unchecked cannot broadcast and that is not recoverable without a new key.
 const SCOPE_LABELS: Record<string, string> = {
-  "mcp:read": "Read your workflows, executions, and plugin schemas",
-  "mcp:write": "Write your workflows, executions, and integrations",
+  "mcp:read":
+    "Read your workflows, executions, and plugin schemas. Cannot run workflows or send transactions.",
+  "mcp:write":
+    "Write your workflows, executions, and integrations, and send transactions",
   "mcp:admin": "Full access to all existing and future actions",
 };
 
@@ -114,7 +119,14 @@ function CreateApiKeyOverlay({
         fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: keyName.trim() || null, ...extra }),
+          body: JSON.stringify({
+            name: keyName.trim() || null,
+            // The same Permissions block is shown to wallet users, so the
+            // selection has to reach the API here too. Omitting it minted an
+            // unscoped key that ignored whatever the user unchecked.
+            scopes: activeScopes,
+            ...extra,
+          }),
         })
       );
       if (!response.ok) {

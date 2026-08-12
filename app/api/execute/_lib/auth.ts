@@ -17,6 +17,11 @@ export type ApiKeyAuthError = { error: string; status: number };
  * Returns the org context if valid, otherwise an `{ error, status }` failure
  * (401 for missing/invalid credentials, 403 for forbidden principals such as
  * anonymous accounts). Callers branch on `"error" in result`.
+ *
+ * `scope` carries whatever the credential was minted with, for both branches,
+ * so the routes' requireScope() gates apply to API keys as well as OAuth
+ * tokens. It is undefined only when the credential has no scope at all (an
+ * API key whose `scope` column is NULL), which stays full-access.
  */
 export async function validateApiKey(
   request: Request
@@ -42,6 +47,7 @@ export async function validateApiKey(
     return {
       organizationId: result.organizationId,
       apiKeyId: result.apiKeyId,
+      scope: result.scope,
     };
   }
 

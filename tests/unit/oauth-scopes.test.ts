@@ -58,10 +58,29 @@ describe("oauth-scopes — project & tag tools", () => {
 });
 
 describe("oauth-scopes — scopeSatisfies (A-03)", () => {
-  it("undefined granted scope passes every level (non-OAuth full access)", () => {
+  it("undefined granted scope passes every level (unscoped caller)", () => {
     expect(scopeSatisfies(undefined, "mcp:read")).toBe(true);
     expect(scopeSatisfies(undefined, "mcp:write")).toBe(true);
     expect(scopeSatisfies(undefined, "mcp:admin")).toBe(true);
+  });
+
+  it("treats a NULL API key scope column as unscoped, not as an empty grant", () => {
+    // authenticateApiKey coerces the nullable column with `?? undefined`.
+    // The two must not be conflated: null means full access, "" denies all.
+    const nullScopeColumn: string | null = null;
+
+    expect(scopeSatisfies(nullScopeColumn ?? undefined, "mcp:write")).toBe(
+      true
+    );
+    expect(scopeSatisfies("", "mcp:write")).toBe(false);
+  });
+
+  it("gates an API key scope string exactly like an OAuth scope claim", () => {
+    // /api/execute/* now forwards the key's scope to requireScope, so a key
+    // minted mcp:read must fail a write sink.
+    expect(scopeSatisfies("mcp:read", "mcp:write")).toBe(false);
+    expect(scopeSatisfies("mcp:read", "mcp:read")).toBe(true);
+    expect(scopeSatisfies("mcp:admin", "mcp:write")).toBe(true);
   });
 
   it("mcp:read satisfies read but not write or admin", () => {

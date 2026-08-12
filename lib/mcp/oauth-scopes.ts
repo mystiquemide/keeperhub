@@ -176,10 +176,12 @@ const SCOPE_RANK: Record<OAuthScope, number> = {
 
 /**
  * True when `grantedScope` satisfies the `required` scope level.
- * `undefined` means no scope restriction (kh_ API key / cookie session /
- * internal service) and always passes -- those callers are intentionally
- * full-access. An empty or all-invalid scope string fails for every level
- * (matches isToolAllowed("") === false). Only OAuth Bearer tokens are gated.
+ * `undefined` means the caller carries no scope at all -- a cookie session, an
+ * internal service, or a kh_ API key whose `scope` column is NULL -- and
+ * always passes, because those callers are intentionally full-access. An empty
+ * or all-invalid scope string fails for every level (matches
+ * isToolAllowed("") === false). OAuth Bearer tokens and kh_ API keys minted
+ * with a scope are both gated on the string they carry.
  */
 export function scopeSatisfies(
   grantedScope: string | undefined,

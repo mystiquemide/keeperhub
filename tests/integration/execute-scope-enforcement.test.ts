@@ -91,6 +91,8 @@ vi.mock("@/lib/features/route-guard", () => ({
 vi.mock("@/lib/logging", () => ({
   ErrorCategory: { DATABASE: "DATABASE" },
   logSystemError: vi.fn(),
+  // requireScope emits this on every denial, which is what these tests assert.
+  logSecurityEvent: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
