@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// These cases cover the in-memory bookkeeping (sweep, stats). Pinning Redis to
+// absent keeps them on the fallback path regardless of the ambient env.
+vi.mock("@/lib/redis", () => ({ getRedis: () => null }));
+
 import {
   checkIpRateLimit,
   checkMcpRateLimit,
@@ -26,8 +31,8 @@ describe("mcp/rate-limit", () => {
   });
 
   describe("cleanupExpiredRateLimitEntries", () => {
-    it("removes organisation entries whose newest timestamp is past the stale threshold", () => {
-      checkMcpRateLimit("org-a");
+    it("removes organisation entries whose newest timestamp is past the stale threshold", async () => {
+      await checkMcpRateLimit("org-a");
       expect(getRateLimitStats().organizationCount).toBe(1);
 
       vi.setSystemTime(Date.now() + STALE_AFTER_MS + 1);
@@ -46,8 +51,8 @@ describe("mcp/rate-limit", () => {
       expect(getRateLimitStats().ipCount).toBe(0);
     });
 
-    it("preserves entries with activity inside the stale threshold", () => {
-      checkMcpRateLimit("org-active");
+    it("preserves entries with activity inside the stale threshold", async () => {
+      await checkMcpRateLimit("org-active");
       checkIpRateLimit("9.9.9.9", 10, WINDOW_MS);
 
       // Half-way through the stale window
@@ -59,13 +64,13 @@ describe("mcp/rate-limit", () => {
       expect(stats.ipCount).toBe(1);
     });
 
-    it("does not break rate-limit decisions when called against an at-limit entry", () => {
-      const allowed = Array.from({ length: LIMIT }, () =>
-        checkMcpRateLimit("org-busy")
+    it("does not break rate-limit decisions when called against an at-limit entry", async () => {
+      const allowed = await Promise.all(
+        Array.from({ length: LIMIT }, () => checkMcpRateLimit("org-busy"))
       );
       expect(allowed.every((r) => r.allowed)).toBe(true);
 
-      const blocked = checkMcpRateLimit("org-busy");
+      const blocked = await checkMcpRateLimit("org-busy");
       expect(blocked.allowed).toBe(false);
 
       // Cleanup must NOT drop an entry whose newest timestamp is `now`.
@@ -73,7 +78,7 @@ describe("mcp/rate-limit", () => {
       expect(getRateLimitStats().organizationCount).toBe(1);
 
       // And the block must persist.
-      const stillBlocked = checkMcpRateLimit("org-busy");
+      const stillBlocked = await checkMcpRateLimit("org-busy");
       expect(stillBlocked.allowed).toBe(false);
     });
 
@@ -96,12 +101,12 @@ describe("mcp/rate-limit", () => {
       expect(getRateLimitStats().ipCount).toBe(0);
     });
 
-    it("reproduces the leak case: idle keys accumulate without cleanup, are released after cleanup", () => {
-      checkMcpRateLimit("org-a");
+    it("reproduces the leak case: idle keys accumulate without cleanup, are released after cleanup", async () => {
+      await checkMcpRateLimit("org-a");
       vi.setSystemTime(Date.now() + STALE_AFTER_MS + 1);
 
       // Without cleanup: a brand-new key is added and the stale one stays.
-      checkMcpRateLimit("org-b");
+      await checkMcpRateLimit("org-b");
       expect(getRateLimitStats().organizationCount).toBe(2);
 
       // With cleanup: only the recently-active key remains.

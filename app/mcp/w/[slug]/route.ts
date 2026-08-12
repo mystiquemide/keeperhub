@@ -376,7 +376,7 @@ export async function POST(
 
   const organizationId = auth.organizationId ?? "";
 
-  const rateLimit = checkMcpRateLimit(organizationId);
+  const rateLimit = await checkMcpRateLimit(organizationId);
   if (!rateLimit.allowed) {
     logMcpEvent("mcp.rate.limited", { orgId: organizationId });
     return rateLimitResponse(rateLimit);

@@ -1,6 +1,15 @@
-// In-memory per pod. In a multi-replica deployment, each pod tracks its own window.
-// Effective limit is LIMIT * num_replicas. Replace with Redis-backed solution
-// when replica count grows.
+// Rate limits for the MCP surface.
+//
+// The per-organization limiter is Redis-backed so the ceiling is fleet-wide.
+// It previously lived in a module-level Map, which made the real ceiling
+// LIMIT * num_replicas: an agent spraying requests across pods got a multiple
+// of the intended budget.
+//
+// The per-IP limiter below is still in-memory per pod.
+
+import { ErrorCategory, logSystemWarn } from "@/lib/logging";
+import { getRedis } from "@/lib/redis";
+import { mcpRateLimitKey } from "@/lib/redis-keys";
 
 export const WINDOW_MS = 60_000; // 1 minute
 export const LIMIT = 120; // requests per window (higher than execute endpoint; MCP sessions are chatty)
@@ -13,11 +22,25 @@ export const LIMIT = 120; // requests per window (higher than execute endpoint; 
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const STALE_THRESHOLD_MULTIPLIER = 5;
 
+// Hard cap on organizations tracked by the in-memory fallback. The fallback
+// only fills while Redis is down, and an outage must not let a flood of
+// distinct organization ids grow the map without bound.
+const MAX_FALLBACK_ORGANIZATIONS = 10_000;
+
+const DEGRADED_LOG_INTERVAL_MS = 60_000;
+
 const requestLog = new Map<string, number[]>();
 const ipRequestLog = new Map<string, number[]>();
 
 let maxWindowMs = WINDOW_MS;
 let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+let lastDegradedLogAt = 0;
+let memberSequence = 0;
+
+// Unique per process so two pods adding a member in the same millisecond
+// cannot collide on the same sorted-set entry and silently merge two
+// requests into one.
+const PROCESS_TOKEN = globalThis.crypto.randomUUID();
 
 export type RateLimitResult =
   | { allowed: true; limit: number; remaining: number; reset: number }
@@ -29,36 +52,215 @@ export type RateLimitResult =
       reset: number;
     };
 
-export function checkMcpRateLimit(organizationId: string): RateLimitResult {
-  const now = Date.now();
-  const windowStart = now - WINDOW_MS;
+// Sliding window over a sorted set, scored by request timestamp. Trim, count
+// and add have to happen in one server-side step: split across round trips,
+// two concurrent requests both read a count below the limit and both get
+// admitted, which is a bypass of exactly the size of the concurrency.
+//
+// Sliding rather than fixed window because a fixed window admits 2 * LIMIT
+// across a boundary, and because it preserves the reset/retryAfter semantics
+// the existing callers and headers already expose.
+//
+// Returns { allowed, count-in-window, oldest-score-ms }.
+const SLIDING_WINDOW_SCRIPT = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local windowMs = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local member = ARGV[4]
 
-  const timestamps = requestLog.get(organizationId);
-  const recent = timestamps ? timestamps.filter((t) => t > windowStart) : [];
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - windowMs)
+local count = redis.call('ZCARD', key)
 
-  if (recent.length >= LIMIT) {
-    // Oldest timestamp in window determines when the first slot opens
-    const oldestInWindow = recent[0];
-    const retryAfter = Math.ceil((oldestInWindow + WINDOW_MS - now) / 1000);
+if count >= limit then
+  local head = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  local oldest = now
+  if head[2] then oldest = tonumber(head[2]) end
+  return {0, count, oldest}
+end
+
+redis.call('ZADD', key, now, member)
+redis.call('PEXPIRE', key, windowMs)
+
+local head = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+local oldest = now
+if head[2] then oldest = tonumber(head[2]) end
+return {1, count + 1, oldest}
+`;
+
+function nextMember(now: number): string {
+  memberSequence += 1;
+  return `${now}-${PROCESS_TOKEN}-${memberSequence}`;
+}
+
+function buildResult(input: {
+  allowed: boolean;
+  count: number;
+  oldestMs: number;
+  now: number;
+  limit: number;
+  windowMs: number;
+}): RateLimitResult {
+  const { allowed, count, oldestMs, now, limit, windowMs } = input;
+  // The oldest request in the window is what frees the next slot.
+  const resetMs = oldestMs + windowMs;
+  const reset = Math.ceil(resetMs / 1000);
+
+  if (allowed) {
     return {
-      allowed: false,
-      retryAfter: Math.max(retryAfter, 1),
-      limit: LIMIT,
-      remaining: 0,
-      reset: Math.ceil((oldestInWindow + WINDOW_MS) / 1000),
+      allowed: true,
+      limit,
+      remaining: Math.max(limit - count, 0),
+      reset,
     };
   }
 
-  recent.push(now);
-  requestLog.set(organizationId, recent);
-
-  const reset = Math.ceil((recent[0] + WINDOW_MS) / 1000);
   return {
-    allowed: true,
-    limit: LIMIT,
-    remaining: LIMIT - recent.length,
+    allowed: false,
+    retryAfter: Math.max(Math.ceil((resetMs - now) / 1000), 1),
+    limit,
+    remaining: 0,
     reset,
   };
+}
+
+function parseWindowReply(
+  reply: unknown
+): { allowed: boolean; count: number; oldestMs: number } | null {
+  if (!Array.isArray(reply) || reply.length < 3) {
+    return null;
+  }
+  const [allowed, count, oldestMs] = reply.map(Number);
+  if (
+    !(
+      Number.isFinite(allowed) &&
+      Number.isFinite(count) &&
+      Number.isFinite(oldestMs)
+    )
+  ) {
+    return null;
+  }
+  return { allowed: allowed === 1, count, oldestMs };
+}
+
+// Losing Redis means losing the shared counter, not the limit. The fallback
+// below keeps enforcing LIMIT per replica, so an outage degrades the ceiling
+// to what it was before this module was Redis-backed rather than removing it:
+// failing open would hand an attacker an unmetered MCP endpoint at precisely
+// the moment the platform is least healthy. Throttled because this sits on
+// the request hot path and logSystemWarn reaches Sentry.
+function warnDegraded(reason: string, error: unknown): void {
+  const now = Date.now();
+  if (now - lastDegradedLogAt < DEGRADED_LOG_INTERVAL_MS) {
+    return;
+  }
+  lastDegradedLogAt = now;
+  logSystemWarn(
+    ErrorCategory.INFRASTRUCTURE,
+    `[MCP Rate Limit] Redis unavailable (${reason}), falling back to per-pod limiting`,
+    error,
+    { operation: "mcp_rate_limit" }
+  );
+}
+
+// Called only when the fallback is at its cap and needs room for a new
+// organization. Sweeping stale entries usually frees space; if every tracked
+// organization is still active, drop the least recently active one so memory
+// stays bounded.
+function evictForNewFallbackEntry(): void {
+  cleanupExpiredRateLimitEntries();
+  if (requestLog.size < MAX_FALLBACK_ORGANIZATIONS) {
+    return;
+  }
+
+  let stalestKey: string | null = null;
+  let stalestSeen = Number.POSITIVE_INFINITY;
+  for (const [key, timestamps] of requestLog) {
+    const newest = timestamps.at(-1) ?? 0;
+    if (newest < stalestSeen) {
+      stalestSeen = newest;
+      stalestKey = key;
+    }
+  }
+  if (stalestKey !== null) {
+    requestLog.delete(stalestKey);
+  }
+}
+
+function checkInMemoryWindow(
+  log: Map<string, number[]>,
+  key: string,
+  limit: number,
+  windowMs: number,
+  now: number
+): RateLimitResult {
+  const windowStart = now - windowMs;
+  const timestamps = log.get(key);
+  const recent = timestamps ? timestamps.filter((t) => t > windowStart) : [];
+
+  if (recent.length >= limit) {
+    return buildResult({
+      allowed: false,
+      count: recent.length,
+      oldestMs: recent[0],
+      now,
+      limit,
+      windowMs,
+    });
+  }
+
+  recent.push(now);
+  log.set(key, recent);
+
+  return buildResult({
+    allowed: true,
+    count: recent.length,
+    oldestMs: recent[0],
+    now,
+    limit,
+    windowMs,
+  });
+}
+
+export async function checkMcpRateLimit(
+  organizationId: string
+): Promise<RateLimitResult> {
+  const now = Date.now();
+  const redis = getRedis();
+
+  if (redis) {
+    try {
+      const reply = await redis.eval(
+        SLIDING_WINDOW_SCRIPT,
+        1,
+        mcpRateLimitKey(organizationId),
+        now,
+        WINDOW_MS,
+        LIMIT,
+        nextMember(now)
+      );
+      const parsed = parseWindowReply(reply);
+      if (parsed) {
+        return buildResult({
+          ...parsed,
+          now,
+          limit: LIMIT,
+          windowMs: WINDOW_MS,
+        });
+      }
+      warnDegraded("unexpected reply", undefined);
+    } catch (error) {
+      warnDegraded("command failed", error);
+    }
+  }
+
+  if (
+    !requestLog.has(organizationId) &&
+    requestLog.size >= MAX_FALLBACK_ORGANIZATIONS
+  ) {
+    evictForNewFallbackEntry();
+  }
+  return checkInMemoryWindow(requestLog, organizationId, LIMIT, WINDOW_MS, now);
 }
 
 export function checkIpRateLimit(
@@ -69,29 +271,7 @@ export function checkIpRateLimit(
   if (windowMs > maxWindowMs) {
     maxWindowMs = windowMs;
   }
-  const now = Date.now();
-  const windowStart = now - windowMs;
-
-  const timestamps = ipRequestLog.get(ip);
-  const recent = timestamps ? timestamps.filter((t) => t > windowStart) : [];
-
-  if (recent.length >= limit) {
-    const oldestInWindow = recent[0];
-    const retryAfter = Math.ceil((oldestInWindow + windowMs - now) / 1000);
-    return {
-      allowed: false,
-      retryAfter: Math.max(retryAfter, 1),
-      limit,
-      remaining: 0,
-      reset: Math.ceil((oldestInWindow + windowMs) / 1000),
-    };
-  }
-
-  recent.push(now);
-  ipRequestLog.set(ip, recent);
-
-  const reset = Math.ceil((recent[0] + windowMs) / 1000);
-  return { allowed: true, limit, remaining: limit - recent.length, reset };
+  return checkInMemoryWindow(ipRequestLog, ip, limit, windowMs, Date.now());
 }
 
 export function getClientIp(request: Request): string {
@@ -155,7 +335,8 @@ export function stopRateLimitCleanupInterval(): void {
   }
 }
 
-// Tracked-entry counts. Useful for /healthz or memory observability.
+// Tracked-entry counts. Useful for /healthz or memory observability. The
+// organization count only moves while the Redis-backed limiter is degraded.
 export function getRateLimitStats(): {
   organizationCount: number;
   ipCount: number;
@@ -173,4 +354,5 @@ export function resetRateLimitState(): void {
   requestLog.clear();
   ipRequestLog.clear();
   maxWindowMs = WINDOW_MS;
+  lastDegradedLogAt = 0;
 }

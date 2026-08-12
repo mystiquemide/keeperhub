@@ -29,6 +29,14 @@ export function trustedCountryKey(userId: string, country: string): string {
   return deploymentKey("trust-country", userId, country);
 }
 
+/**
+ * Sliding-window counter for the per-organization MCP rate limit. Shared
+ * across replicas so the limit is a fleet-wide ceiling, not a per-pod one.
+ */
+export function mcpRateLimitKey(organizationId: string): string {
+  return deploymentKey("ratelimit", "mcp", organizationId);
+}
+
 /** Short-lived cache of a holder's native balance in wei, for the gas preflight. */
 export function nativeBalanceKey(chainId: number, address: string): string {
   return deploymentKey("gas-balance", String(chainId), address.toLowerCase());

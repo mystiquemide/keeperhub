@@ -1,4 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// The MCP limiter prefers Redis; pin it to absent so this file asserts the
+// shared result metadata rather than the store behind it.
+vi.mock("@/lib/redis", () => ({ getRedis: () => null }));
+
 import {
   __resetAiGenerateRateLimitForTests,
   checkAiGenerateRateLimit,
@@ -58,8 +63,8 @@ describe("checkRateLimit (execute)", () => {
 });
 
 describe("checkMcpRateLimit", () => {
-  it("reports the MCP limit and remaining on an allowed request", () => {
-    const result = checkMcpRateLimit("org-meta-1");
+  it("reports the MCP limit and remaining on an allowed request", async () => {
+    const result = await checkMcpRateLimit("org-meta-1");
     expect(result.allowed).toBe(true);
     if (result.allowed) {
       expect(result.limit).toBe(MCP_LIMIT);
