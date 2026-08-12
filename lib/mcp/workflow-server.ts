@@ -135,9 +135,23 @@ export function createWorkflowMcpServer(
       title: listing.name,
       description: toolDescription,
       inputSchema,
+      // listing.workflowType does not describe side effects, so it cannot
+      // drive these hints. The call route runs a "read" listing server-side
+      // with the owner's wallet and credentials (handleReadWorkflow ->
+      // startExecutionInBackground) while a "write" listing only returns
+      // unsigned calldata for the caller to sign, so "read" is the branch
+      // that actually executes. deriveWorkflowType in lib/mcp/calldata.ts
+      // classifies a listing "write" only for write-contract/protocol-write
+      // nodes, leaving fund transfers, token approvals, typed-data signing
+      // and every outbound-message node typed "read".
+      //
+      // The listing body is author-controlled and no per-action read/write
+      // metadata exists to classify it, so nothing available here bounds
+      // what a call does. Both hints therefore stay at the MCP defaults for
+      // an unbounded tool rather than claiming a safety we cannot establish.
       annotations: {
-        readOnlyHint: listing.workflowType === "read",
-        destructiveHint: false,
+        readOnlyHint: false,
+        destructiveHint: true,
       },
     },
     async (args: unknown) => {

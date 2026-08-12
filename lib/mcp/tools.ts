@@ -629,6 +629,33 @@ const GET_EXECUTION_SCHEMA = {
     ),
 };
 
+/**
+ * Tool annotation policy.
+ *
+ * Clients use these hints to decide what to auto-approve, so an inaccurate
+ * hint is a security control failure, not a cosmetic one. The MCP spec
+ * defaults are readOnlyHint=false, destructiveHint=true, idempotentHint=false
+ * and openWorldHint=true, and destructiveHint/idempotentHint are only
+ * meaningful when readOnlyHint is false. Writing `destructiveHint: false` is
+ * therefore an explicit downgrade away from the safe default and must be
+ * justified per tool.
+ *
+ * Rules applied here:
+ *  - readOnlyHint: true only when the tool reads and computes and changes no
+ *    state anywhere, including in other orgs and on chain. It must never
+ *    contradict the read/write split in oauth-scopes.ts.
+ *  - destructiveHint: false only for writes that are purely additive -- they
+ *    create a new record that starts inert, overwrite and destroy nothing,
+ *    and emit nothing outside the platform.
+ *  - destructiveHint: true for anything that overwrites existing state, moves
+ *    value, broadcasts a transaction, changes public exposure, sends an
+ *    unrecallable outbound message, or dispatches or arms an execution whose
+ *    effects we cannot bound from the arguments alone.
+ *  - idempotentHint and openWorldHint are left at their spec defaults: every
+ *    write here is unsafe to blind-retry (several take an explicit
+ *    idempotency_key for exactly that reason) and every tool can reach an
+ *    external system, so the defaults are already the conservative values.
+ */
 export function registerTools(
   server: McpServer,
   internalApiBaseUrl: string,
@@ -725,7 +752,11 @@ export function registerTools(
         .describe("Optional tag ID to label the workflow"),
       idempotency_key: IDEMPOTENCY_KEY_ARG,
     },
-    { title: "Create Workflow", readOnlyHint: false, destructiveHint: false },
+    // nodes is an unconstrained record array, so it accepts write-contract
+    // and transfer actions, and enabled=true arms a schedule/event/block/
+    // webhook trigger on the same call. One call therefore starts a
+    // recurring unattended run of arbitrary node content.
+    { title: "Create Workflow", readOnlyHint: false, destructiveHint: true },
     withScopeCheck("create_workflow", scope, async (args) =>
       withToolLogging("create_workflow", undefined, async () => {
         const data = await callApi(
@@ -784,7 +815,9 @@ export function registerTools(
         .optional()
         .describe("Tag ID to assign (null to unassign)"),
     },
-    { title: "Update Workflow", readOnlyHint: false, destructiveHint: false },
+    // nodes/edges are a full replace, and enabled toggles live triggers, so
+    // this overwrites state a caller may not be able to reconstruct.
+    { title: "Update Workflow", readOnlyHint: false, destructiveHint: true },
     withScopeCheck("update_workflow", scope, async (args) =>
       withToolLogging("update_workflow", undefined, async () => {
         const { workflowId, ...body } = args;
@@ -952,7 +985,9 @@ export function registerTools(
         .describe("Optional input data to pass to the workflow trigger"),
       idempotency_key: IDEMPOTENCY_KEY_ARG,
     },
-    { title: "Execute Workflow", readOnlyHint: false, destructiveHint: false },
+    // The workflow body is arbitrary: a run can transfer funds or call any
+    // contract. Nothing in the arguments bounds that, so assume the worst.
+    { title: "Execute Workflow", readOnlyHint: false, destructiveHint: true },
     withScopeCheck("execute_workflow", scope, async (args) =>
       withToolLogging("execute_workflow", undefined, async () => {
         const data = await callApi(
@@ -1139,9 +1174,12 @@ export function registerTools(
         .optional()
         .describe("Additional context or constraints for the AI generator"),
     },
+    // Persists nothing, but /api/ai/generate hard-requires mcp:write and
+    // spends a rate-limited external model call, so claiming read-only would
+    // contradict the scope model in oauth-scopes.ts.
     {
       title: "AI Generate Workflow",
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
     },
     withScopeCheck("ai_generate_workflow", scope, async (args) =>
@@ -1379,6 +1417,9 @@ export function registerTools(
         .optional()
         .describe("Optional name for the cloned workflow"),
     },
+    // Unlike create_workflow this takes no `enabled` argument, and the
+    // duplicate route inserts without one so the row falls to the schema
+    // default of disabled. The clone is inert until a separate call arms it.
     { title: "Deploy Template", readOnlyHint: false, destructiveHint: false },
     withScopeCheck("deploy_template", scope, async (args) =>
       withToolLogging("deploy_template", undefined, async () => {
@@ -1860,7 +1901,11 @@ export function registerTools(
           "Credential fields to test (same shape as integration config)"
         ),
     },
-    { title: "Test Notification", readOnlyHint: false, destructiveHint: false },
+    // type and config are caller-supplied and reach the plugin unfiltered,
+    // so this sends a real message to an address the caller chooses, or
+    // opens a database connection to a host it names. The send cannot be
+    // recalled; persisting nothing does not make it additive.
+    { title: "Test Notification", readOnlyHint: false, destructiveHint: true },
     withScopeCheck("test_notification", scope, async (args) =>
       withToolLogging("test_notification", undefined, async () => {
         const data = await callApi(
@@ -1902,10 +1947,12 @@ export function registerTools(
         .describe("Optional on-chain expiry override"),
       idempotency_key: IDEMPOTENCY_KEY_ARG,
     },
+    // Produces a signed transfer authorization against org funds, and
+    // broadcastMode "schedule" sends it without a further call.
     {
       title: "Tempo Sign and Hold",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
     },
     withScopeCheck("tempo_sign_and_hold", scope, async (args) =>
       withToolLogging("tempo_sign_and_hold", undefined, async () => {
@@ -1953,10 +2000,11 @@ export function registerTools(
         .string()
         .describe("Held payment ID from tempo_sign_and_hold"),
     },
+    // Permanently voids a pending payment; the signature cannot be revived.
     {
       title: "Tempo Cancel Hold",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
     },
     withScopeCheck("tempo_cancel_hold", scope, async (args) =>
       withToolLogging("tempo_cancel_hold", undefined, async () => {
@@ -1983,10 +2031,11 @@ export function registerTools(
         .describe("Held payment ID from tempo_sign_and_hold"),
       idempotency_key: IDEMPOTENCY_KEY_ARG,
     },
+    // Broadcasts the held transfer. Irreversible movement of real funds.
     {
       title: "Tempo Release Hold",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
     },
     withScopeCheck("tempo_release_hold", scope, async (args) =>
       withToolLogging("tempo_release_hold", undefined, async () => {
@@ -2156,10 +2205,13 @@ export function registerMetaTools(
           "Action parameters as key-value pairs (e.g., {network: '1', address: '0x...'}). Use search_protocol_actions to discover required params."
         ),
     },
+    // actionType selects both reads (chronicle/eth-usd-read) and writes
+    // (aave-v3/supply) through one entry point, and a static annotation
+    // cannot vary by argument, so it takes the worst case of the two.
     {
       title: "Execute Protocol Action",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
     },
     withScopeCheck("execute_protocol_action", scope, async (args) =>
       withToolLogging("execute_protocol_action", undefined, async () => {
@@ -2270,7 +2322,9 @@ export function registerMetaTools(
         .record(z.string(), z.unknown())
         .describe("Input fields as declared in the workflow's inputSchema"),
     },
-    { title: "Call Workflow", readOnlyHint: false, destructiveHint: false },
+    // Invokes a third-party listing whose body we do not control, and a paid
+    // listing charges USDC on retry after the 402 is settled.
+    { title: "Call Workflow", readOnlyHint: false, destructiveHint: true },
     withScopeCheck("call_workflow", scope, async (args) =>
       withToolLogging("call_workflow", undefined, async () => {
         try {
@@ -2338,7 +2392,10 @@ export function registerMetaTools(
           "Workflow type: 'read' for read-only, 'write' for state-changing"
         ),
     },
-    { title: "List Workflow", readOnlyHint: false, destructiveHint: false },
+    // Makes a private workflow publicly callable and full-replaces the
+    // listing's inputSchema/outputMapping, matching unlist_workflow, its
+    // inverse.
+    { title: "List Workflow", readOnlyHint: false, destructiveHint: true },
     withScopeCheck("list_workflow", scope, async (args) =>
       withToolLogging("list_workflow", undefined, async () => {
         const { workflowId, ...metadata } = args;
@@ -2414,10 +2471,12 @@ export function registerMetaTools(
         .optional()
         .describe("Updated price in USDC (only allowed while unlisted)"),
     },
+    // inputSchema, outputMapping and price are full replaces on a listing
+    // other agents are already calling.
     {
       title: "Update Workflow Listing",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
     },
     withScopeCheck("update_workflow_listing", scope, async (args) =>
       withToolLogging("update_workflow_listing", undefined, async () => {
