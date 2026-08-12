@@ -7,7 +7,10 @@
 //
 // The per-IP limiter below is still in-memory per pod.
 
+import type { Redis } from "ioredis";
 import { ErrorCategory, logSystemWarn } from "@/lib/logging";
+import { getMetricsCollector } from "@/lib/metrics";
+import { MetricNames } from "@/lib/metrics/types";
 import { getRedis } from "@/lib/redis";
 import { mcpRateLimitKey } from "@/lib/redis-keys";
 
@@ -22,10 +25,12 @@ export const LIMIT = 120; // requests per window (higher than execute endpoint; 
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const STALE_THRESHOLD_MULTIPLIER = 5;
 
-// Hard cap on organizations tracked by the in-memory fallback. The fallback
-// only fills while Redis is down, and an outage must not let a flood of
-// distinct organization ids grow the map without bound.
-const MAX_FALLBACK_ORGANIZATIONS = 10_000;
+// Hard cap on keys tracked by each in-memory map. The organization map only
+// fills while Redis is down, but the IP map is reachable by unauthenticated
+// callers who can rotate source addresses freely between sweeps, so both are
+// bounded: an evicted key gets a fresh window, which is strictly better than
+// the pod running out of memory.
+const MAX_TRACKED_KEYS = 10_000;
 
 const DEGRADED_LOG_INTERVAL_MS = 60_000;
 
@@ -36,6 +41,7 @@ let maxWindowMs = WINDOW_MS;
 let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 let lastDegradedLogAt = 0;
 let memberSequence = 0;
+let connectAttempt: Promise<void> | null = null;
 
 // Unique per process so two pods adding a member in the same millisecond
 // cannot collide on the same sorted-set entry and silently merge two
@@ -61,13 +67,21 @@ export type RateLimitResult =
 // across a boundary, and because it preserves the reset/retryAfter semantics
 // the existing callers and headers already expose.
 //
-// Returns { allowed, count-in-window, oldest-score-ms }.
-const SLIDING_WINDOW_SCRIPT = `
+// The window is scored by Redis's own clock, not the calling pod's: replicas
+// only share a window if they agree on what time it is, and a pod whose clock
+// drifts past the window length would write entries every other replica
+// immediately trims, quietly buying itself a private budget. TIME is safe
+// inside a script under effect replication (Redis 5+).
+//
+// Returns { allowed, count-in-window, oldest-score-ms, server-now-ms }.
+export const MCP_SLIDING_WINDOW_SCRIPT = `
 local key = KEYS[1]
-local now = tonumber(ARGV[1])
-local windowMs = tonumber(ARGV[2])
-local limit = tonumber(ARGV[3])
-local member = ARGV[4]
+local windowMs = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local member = ARGV[3]
+
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
 
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now - windowMs)
 local count = redis.call('ZCARD', key)
@@ -76,7 +90,7 @@ if count >= limit then
   local head = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
   local oldest = now
   if head[2] then oldest = tonumber(head[2]) end
-  return {0, count, oldest}
+  return {0, count, oldest, now}
 end
 
 redis.call('ZADD', key, now, member)
@@ -85,12 +99,12 @@ redis.call('PEXPIRE', key, windowMs)
 local head = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
 local oldest = now
 if head[2] then oldest = tonumber(head[2]) end
-return {1, count + 1, oldest}
+return {1, count + 1, oldest, now}
 `;
 
-function nextMember(now: number): string {
+function nextMember(): string {
   memberSequence += 1;
-  return `${now}-${PROCESS_TOKEN}-${memberSequence}`;
+  return `${PROCESS_TOKEN}-${memberSequence}`;
 }
 
 function buildResult(input: {
@@ -126,30 +140,48 @@ function buildResult(input: {
 
 function parseWindowReply(
   reply: unknown
-): { allowed: boolean; count: number; oldestMs: number } | null {
-  if (!Array.isArray(reply) || reply.length < 3) {
+): { allowed: boolean; count: number; oldestMs: number; now: number } | null {
+  if (!Array.isArray(reply) || reply.length < 4) {
     return null;
   }
-  const [allowed, count, oldestMs] = reply.map(Number);
+  const [allowed, count, oldestMs, now] = reply.map(Number);
   if (
     !(
       Number.isFinite(allowed) &&
       Number.isFinite(count) &&
-      Number.isFinite(oldestMs)
+      Number.isFinite(oldestMs) &&
+      Number.isFinite(now)
     )
   ) {
     return null;
   }
-  return { allowed: allowed === 1, count, oldestMs };
+  return { allowed: allowed === 1, count, oldestMs, now };
+}
+
+function describeReply(reply: unknown): string {
+  if (Array.isArray(reply)) {
+    return `array(length=${reply.length})`;
+  }
+  if (typeof reply === "string") {
+    return `string("${reply.slice(0, 64)}")`;
+  }
+  return reply === null ? "null" : typeof reply;
 }
 
 // Losing Redis means losing the shared counter, not the limit. The fallback
 // below keeps enforcing LIMIT per replica, so an outage degrades the ceiling
 // to what it was before this module was Redis-backed rather than removing it:
 // failing open would hand an attacker an unmetered MCP endpoint at precisely
-// the moment the platform is least healthy. Throttled because this sits on
-// the request hot path and logSystemWarn reaches Sentry.
-function warnDegraded(reason: string, error: unknown): void {
+// the moment the platform is least healthy.
+//
+// The counter carries every degraded decision so a dashboard can answer
+// whether the shared ceiling is actually being enforced. The Sentry warning is
+// throttled instead, because it sits on the request hot path.
+function recordDegraded(reason: string, error: unknown): void {
+  getMetricsCollector().incrementCounter(MetricNames.MCP_RATE_LIMIT_DEGRADED, {
+    reason,
+  });
+
   const now = Date.now();
   if (now - lastDegradedLogAt < DEGRADED_LOG_INTERVAL_MS) {
     return;
@@ -159,32 +191,60 @@ function warnDegraded(reason: string, error: unknown): void {
     ErrorCategory.INFRASTRUCTURE,
     `[MCP Rate Limit] Redis unavailable (${reason}), falling back to per-pod limiting`,
     error,
-    { operation: "mcp_rate_limit" }
+    { operation: "mcp_rate_limit", reason }
   );
 }
 
-// Called only when the fallback is at its cap and needs room for a new
-// organization. Sweeping stale entries usually frees space; if every tracked
-// organization is still active, drop the least recently active one so memory
-// stays bounded.
-function evictForNewFallbackEntry(): void {
-  cleanupExpiredRateLimitEntries();
-  if (requestLog.size < MAX_FALLBACK_ORGANIZATIONS) {
-    return;
+// The shared client is created with lazyConnect and enableOfflineQueue=false,
+// so the very first command on a cold client is rejected outright while the
+// socket is still opening. Left alone that turns every process start into a
+// bogus "Redis unavailable" report, and the throttled warning would then hide
+// a genuine outage for the rest of the minute. Open the connection explicitly
+// and wait for it instead of firing a command into a socket that cannot yet
+// carry it.
+function ensureConnected(redis: Redis): Promise<void> {
+  if (typeof redis.connect !== "function") {
+    return Promise.resolve();
   }
+  if (redis.status === "wait") {
+    // Rejections here are not swallowed silently: the command that follows
+    // fails too and is reported as a degradation with its own error.
+    connectAttempt ??= redis.connect().then(
+      () => undefined,
+      () => undefined
+    );
+  }
+  return connectAttempt ?? Promise.resolve();
+}
 
-  let stalestKey: string | null = null;
-  let stalestSeen = Number.POSITIVE_INFINITY;
-  for (const [key, timestamps] of requestLog) {
-    const newest = timestamps.at(-1) ?? 0;
-    if (newest < stalestSeen) {
-      stalestSeen = newest;
-      stalestKey = key;
+/**
+ * Opens the shared Redis connection ahead of the first request. Idempotent,
+ * never rejects. Called at boot from instrumentation so no request pays the
+ * connection setup or is mistaken for an outage.
+ */
+export function warmRateLimitRedis(): Promise<void> {
+  const redis = getRedis();
+  return redis ? ensureConnected(redis) : Promise.resolve();
+}
+
+// Map iteration follows insertion order, so re-inserting a key on every touch
+// makes the first key the least recently used one and eviction O(1). Scanning
+// for the stalest entry instead would run over the whole map on every request
+// from an untracked key once it is full -- extra CPU exactly when the platform
+// is already degraded.
+function touchTrackedKey(
+  log: Map<string, number[]>,
+  key: string,
+  timestamps: number[]
+): void {
+  log.delete(key);
+  if (log.size >= MAX_TRACKED_KEYS) {
+    const leastRecent = log.keys().next().value;
+    if (leastRecent !== undefined) {
+      log.delete(leastRecent);
     }
   }
-  if (stalestKey !== null) {
-    requestLog.delete(stalestKey);
-  }
+  log.set(key, timestamps);
 }
 
 function checkInMemoryWindow(
@@ -197,23 +257,17 @@ function checkInMemoryWindow(
   const windowStart = now - windowMs;
   const timestamps = log.get(key);
   const recent = timestamps ? timestamps.filter((t) => t > windowStart) : [];
+  const denied = recent.length >= limit;
 
-  if (recent.length >= limit) {
-    return buildResult({
-      allowed: false,
-      count: recent.length,
-      oldestMs: recent[0],
-      now,
-      limit,
-      windowMs,
-    });
+  if (!denied) {
+    recent.push(now);
   }
-
-  recent.push(now);
-  log.set(key, recent);
+  // Denied callers are written back too: a key being actively refused is the
+  // last one that should be evicted, since eviction hands it a fresh window.
+  touchTrackedKey(log, key, recent);
 
   return buildResult({
-    allowed: true,
+    allowed: !denied,
     count: recent.length,
     oldestMs: recent[0],
     now,
@@ -225,42 +279,45 @@ function checkInMemoryWindow(
 export async function checkMcpRateLimit(
   organizationId: string
 ): Promise<RateLimitResult> {
-  const now = Date.now();
   const redis = getRedis();
 
   if (redis) {
+    if (redis.status !== "ready") {
+      await ensureConnected(redis);
+    }
     try {
       const reply = await redis.eval(
-        SLIDING_WINDOW_SCRIPT,
+        MCP_SLIDING_WINDOW_SCRIPT,
         1,
         mcpRateLimitKey(organizationId),
-        now,
         WINDOW_MS,
         LIMIT,
-        nextMember(now)
+        nextMember()
       );
       const parsed = parseWindowReply(reply);
       if (parsed) {
         return buildResult({
           ...parsed,
-          now,
           limit: LIMIT,
           windowMs: WINDOW_MS,
         });
       }
-      warnDegraded("unexpected reply", undefined);
+      recordDegraded(
+        "unexpected_reply",
+        new Error(`unexpected reply: ${describeReply(reply)}`)
+      );
     } catch (error) {
-      warnDegraded("command failed", error);
+      recordDegraded("command_failed", error);
     }
   }
 
-  if (
-    !requestLog.has(organizationId) &&
-    requestLog.size >= MAX_FALLBACK_ORGANIZATIONS
-  ) {
-    evictForNewFallbackEntry();
-  }
-  return checkInMemoryWindow(requestLog, organizationId, LIMIT, WINDOW_MS, now);
+  return checkInMemoryWindow(
+    requestLog,
+    organizationId,
+    LIMIT,
+    WINDOW_MS,
+    Date.now()
+  );
 }
 
 export function checkIpRateLimit(
@@ -355,4 +412,5 @@ export function resetRateLimitState(): void {
   ipRequestLog.clear();
   maxWindowMs = WINDOW_MS;
   lastDegradedLogAt = 0;
+  connectAttempt = null;
 }

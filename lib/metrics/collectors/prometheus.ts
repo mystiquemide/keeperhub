@@ -858,6 +858,18 @@ const safeFetchBlocks = getOrCreateCounter(
   ["reason", "plugin_name", "shadow"]
 );
 
+// Degradation signal for the per-organization MCP rate limit. Every increment
+// is a decision served by the per-pod fallback instead of the shared Redis
+// window, i.e. a decision taken against a ceiling of LIMIT * num_replicas
+// rather than LIMIT. A non-zero rate here means the fleet-wide limit is not
+// being enforced.
+const mcpRateLimitDegraded = getOrCreateCounter(
+  apiRegistry,
+  "keeperhub_mcp_rate_limit_degraded_total",
+  "MCP rate-limit decisions served from the per-pod fallback because the shared Redis window was unavailable, labelled by reason",
+  ["reason"]
+);
+
 // Error counters
 const pluginErrors = getOrCreateCounter(
   apiRegistry,
@@ -1260,6 +1272,7 @@ const counterMap: Record<string, Counter> = {
   "billing.overage.charged": billingOverageCharged,
   // KEEP-612: see safeFetchBlocks definition above for rationale.
   "safe_fetch.blocks.total": safeFetchBlocks,
+  "ratelimit.mcp.degraded.total": mcpRateLimitDegraded,
 };
 
 const errorCounterMap: Record<string, Counter> = {

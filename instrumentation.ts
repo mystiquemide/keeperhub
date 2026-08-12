@@ -99,10 +99,17 @@ export async function register() {
     // maps. Inline cleanup on the request path can't reach keys that never
     // come back, so without this the maps grow unbounded with one-shot
     // organisations or IPs. See KEEP-419.
-    const { startRateLimitCleanupInterval } = await import(
+    const { startRateLimitCleanupInterval, warmRateLimitRedis } = await import(
       "@/lib/mcp/rate-limit"
     );
     startRateLimitCleanupInterval();
+
+    // The shared Redis client connects lazily with its offline queue disabled,
+    // so the first command on a cold client is rejected while the socket is
+    // still opening. Open it here so the first MCP request reaches the
+    // fleet-wide window instead of the per-pod fallback, and so a cold start
+    // is never reported as an outage. Never rejects; bounded by connectTimeout.
+    await warmRateLimitRedis();
 
     // Initialize Workflow Postgres World (pg-boss queue polling)
     if (process.env.WORKFLOW_TARGET_WORLD === "@workflow/world-postgres") {

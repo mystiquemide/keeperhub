@@ -29,8 +29,17 @@ vi.mock("@/lib/mcp/logging", () => ({
   logMcpEvent: vi.fn(),
 }));
 
+// Resolves rather than returns: the limiter is async, and a plain object
+// would read the same whether or not the route awaited it. With a Promise, a
+// missing await leaves `allowed` undefined and every request 429s, so the
+// happy-path assertions below fail loudly instead of silently passing.
 vi.mock("@/lib/mcp/rate-limit", () => ({
-  checkMcpRateLimit: vi.fn().mockReturnValue({ allowed: true }),
+  checkMcpRateLimit: vi.fn().mockResolvedValue({
+    allowed: true,
+    limit: 120,
+    remaining: 119,
+    reset: 0,
+  }),
   startCleanupInterval: vi.fn(),
 }));
 
